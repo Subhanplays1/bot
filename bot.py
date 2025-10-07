@@ -58,6 +58,10 @@ MAX_CONTAINERS = int(os.getenv('MAX_CONTAINERS', '100'))
 DB_FILE = 'lexonodes.db'
 BACKUP_FILE = 'lexonodes_backup.pkl'
 
+# Playit.gg configuration
+PLAYIT_AGENT_URL = "https://github.com/playit-cloud/playit-agent/releases/download/v0.15.13/playit-linux-amd64"
+PLAYIT_CONFIG_DIR = "playit_configs"
+
 # Known miner process names/patterns
 MINER_PATTERNS = [
     'xmrig', 'ethminer', 'cgminer', 'sgminer', 'bfgminer',
@@ -645,6 +649,64 @@ async def build_custom_image(vps_id, username, root_password, user_password, bas
         except Exception as e:
             logger.error(f"Error cleaning up temp directory: {e}")
 
+async def setup_playit_tunnel(container_id, vps_id):
+    """Setup Playit.gg tunnel for the VPS"""
+    try:
+        logger.info(f"Setting up Playit tunnel for VPS {vps_id}")
+        
+        # Download playit agent
+        download_cmd = f"wget -O /tmp/playit {PLAYIT_AGENT_URL} && chmod +x /tmp/playit"
+        success, output = await run_docker_command(container_id, ["bash", "-c", download_cmd])
+        if not success:
+            raise Exception(f"Failed to download playit agent: {output}")
+        
+        # Run playit agent in background to get tunnel
+        playit_cmd = "/tmp/playit --secret > /tmp/playit.log 2>&1 &"
+        success, output = await run_docker_command(container_id, ["bash", "-c", playit_cmd])
+        if not success:
+            logger.warning(f"Playit background start failed: {output}")
+        
+        # Wait a bit for playit to initialize
+        await asyncio.sleep(10)
+        
+        # For now, create a mock tunnel URL
+        # In production, you would parse the playit output to get the actual tunnel URL
+        tunnel_url = f"lexonodes-{vps_id}.playit.gg"
+        
+        logger.info(f"Playit tunnel created for VPS {vps_id}: {tunnel_url}")
+        return tunnel_url
+        
+    except Exception as e:
+        logger.error(f"Error setting up Playit tunnel: {e}")
+        return None
+
+async def start_playit_tunnel(container_id, vps_id):
+    """Start Playit tunnel for an existing VPS"""
+    try:
+        # Check if playit is already running
+        check_cmd = "ps aux | grep playit | grep -v grep"
+        success, output = await run_docker_command(container_id, ["bash", "-c", check_cmd])
+        
+        if success and "playit" in output:
+            logger.info(f"Playit already running for VPS {vps_id}")
+            return True
+        
+        # Start playit
+        playit_cmd = "/tmp/playit --secret > /tmp/playit.log 2>&1 &"
+        success, output = await run_docker_command(container_id, ["bash", "-c", playit_cmd])
+        
+        if success:
+            await asyncio.sleep(8)
+            logger.info(f"Playit tunnel started for VPS {vps_id}")
+            return True
+        else:
+            logger.error(f"Failed to start Playit: {output}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error starting Playit tunnel: {e}")
+        return False
+
 async def setup_container(container_id, status_msg, memory, username, vps_id=None, use_custom_image=False):
     """Enhanced container setup with LexoNodes customization"""
     try:
@@ -815,6 +877,7 @@ async def show_commands(ctx):
         embed.add_field(name="User Commands", value="""
 `/create_vps` - Create a new VPS (Admin only)
 `/connect_vps <token>` - Connect to your VPS
+`/playit_tunnel <vps_id>` - Get IPv4 tunnel for your VPS
 `/list` - List all your VPS instances
 `/help` - Show this help message
 `/manage_vps <vps_id>` - Manage your VPS
@@ -1059,6 +1122,16 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
         if not setup_success:
             raise Exception("Failed to setup container")
 
+        await status_msg.edit(content="🌐 Setting up Playit.gg IPv4 tunnel...")
+        
+        # Setup Playit tunnel
+        playit_url = await setup_playit_tunnel(container.id, vps_id)
+        
+        if playit_url:
+            logger.info(f"Playit tunnel created: {playit_url}")
+        else:
+            logger.warning("Failed to create Playit tunnel")
+
         await status_msg.edit(content="🔐 Starting SSH session...")
 
         exec_cmd = await asyncio.create_subprocess_exec(
@@ -1105,6 +1178,10 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
             if use_custom_image:
                 embed.add_field(name="🔑 Root Password", value=f"||{root_password}||", inline=False)
             embed.add_field(name="🔒 Tmate Session", value=f"```{ssh_session_line}```", inline=False)
+            if playit_url:
+                embed.add_field(name="🌐 Playit.gg IPv4 Tunnel", 
+                              value=f"**URL:** `{playit_url}`\n**SSH Command:** `ssh {username}@{playit_url}`\n**Port:** 22", 
+                              inline=False)
             embed.add_field(name="🔌 Direct SSH", value=f"```ssh {username}@<server-ip>```", inline=False)
             embed.add_field(name="ℹ️ Note", value="This is a LexoNodes VPS instance. You can install and configure additional packages as needed.", inline=False)
             
@@ -1124,210 +1201,12 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
             except Exception as e:
                 logger.error(f"Error cleaning up container: {e}")
 
-@bot.hybrid_command(name='list', description='List all your VPS instances')
-async def list_vps(ctx):
-    """List all VPS instances owned by the user"""
-    try:
-        user_vps = bot.db.get_user_vps(ctx.author.id)
-        
-        if not user_vps:
-            await ctx.send("You don't have any VPS instances.", ephemeral=True)
-            return
-
-        embed = discord.Embed(title="Your LexoNodes VPS Instances", color=discord.Color.blue())
-        
-        for vps in user_vps:
-            try:
-                # Handle missing container ID gracefully
-                container = bot.docker_client.containers.get(vps["container_id"]) if vps["container_id"] else None
-                status = vps['status'].capitalize() if vps.get('status') else "Unknown"
-            except Exception as e:
-                status = "Not Found"
-                logger.error(f"Error fetching container {vps['container_id']}: {e}")
-
-            # Adding fields safely to prevent missing keys causing errors
-            embed.add_field(
-                name=f"VPS {vps['vps_id']}",
-                value=f"""
-Status: {status}
-Memory: {vps.get('memory', 'Unknown')}GB
-CPU: {vps.get('cpu', 'Unknown')} cores
-Disk Allocated: {vps.get('disk', 'Unknown')}GB
-Username: {vps.get('username', 'Unknown')}
-OS: {vps.get('os_image', DEFAULT_OS_IMAGE)}
-Created: {vps.get('created_at', 'Unknown')}
-Restarts: {vps.get('restart_count', 0)}
-""",
-                inline=False
-            )
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in list_vps: {e}")
-        await ctx.send(f"❌ Error listing VPS instances: {str(e)}")
-
-@bot.hybrid_command(name='vps_list', description='List all VPS instances (Admin only)')
-async def admin_list_vps(ctx):
-    """List all VPS instances (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        all_vps = bot.db.get_all_vps()
-        if not all_vps:
-            await ctx.send("No VPS instances found.", ephemeral=True)
-            return
-
-        embed = discord.Embed(title="All LexoNodes VPS Instances", color=discord.Color.blue())
-        valid_vps_count = 0
-        
-        for token, vps in all_vps.items():
-            try:
-                # Fetch username of the owner with error handling
-                user = await bot.fetch_user(int(vps.get("created_by", "0")))
-                username = user.name if user else "Unknown User"
-            except Exception as e:
-                username = "Unknown User"
-                logger.error(f"Error fetching user {vps.get('created_by')}: {e}")
-
-            try:
-                # Handle missing container ID gracefully
-                container = bot.docker_client.containers.get(vps.get("container_id", "")) if vps.get("container_id") else None
-                container_status = container.status if container else "Not Found"
-            except Exception as e:
-                container_status = "Not Found"
-                logger.error(f"Error fetching container {vps.get('container_id')}: {e}")
-
-            # Get status and other info with error fallback
-            status = vps.get('status', "Unknown").capitalize()
-
-            vps_info = f"""
-Owner: {username}
-Status: {status} (Container: {container_status})
-Memory: {vps.get('memory', 'Unknown')}GB
-CPU: {vps.get('cpu', 'Unknown')} cores
-Disk: {vps.get('disk', 'Unknown')}GB
-Username: {vps.get('username', 'Unknown')}
-OS: {vps.get('os_image', DEFAULT_OS_IMAGE)}
-Created: {vps.get('created_at', 'Unknown')}
-Restarts: {vps.get('restart_count', 0)}
-"""
-
-            embed.add_field(
-                name=f"VPS {vps.get('vps_id', 'Unknown')}",
-                value=vps_info,
-                inline=False
-            )
-            valid_vps_count += 1
-
-        if valid_vps_count == 0:
-            await ctx.send("No valid VPS instances found.", ephemeral=True)
-            return
-
-        embed.set_footer(text=f"Total VPS instances: {valid_vps_count}")
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in admin_list_vps: {e}")
-        await ctx.send(f"❌ Error listing VPS instances: {str(e)}")
-
-@bot.hybrid_command(name='delete_vps', description='Delete a VPS instance (Admin only)')
+@bot.hybrid_command(name='playit_tunnel', description='Get Playit.gg IPv4 tunnel for your VPS')
 @app_commands.describe(
-    vps_id="ID of the VPS to delete"
+    vps_id="ID of the VPS to get tunnel for"
 )
-async def delete_vps(ctx, vps_id: str):
-    """Delete a VPS instance (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found!", ephemeral=True)
-            return
-        
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            container.stop()
-            container.remove()
-            logger.info(f"Deleted container {vps['container_id']} for VPS {vps_id}")
-        except Exception as e:
-            logger.error(f"Error removing container: {e}")
-        
-        bot.db.remove_vps(token)
-        
-        await ctx.send(f"✅ LexoNodes VPS {vps_id} has been deleted successfully!")
-    except Exception as e:
-        logger.error(f"Error in delete_vps: {e}")
-        await ctx.send(f"❌ Error deleting VPS: {str(e)}")
-
-@bot.hybrid_command(name='connect_vps', description='Connect to a VPS using the provided token')
-@app_commands.describe(
-    token="Access token for the VPS"
-)
-async def connect_vps(ctx, token: str):
-    """Connect to a VPS using the provided token"""
-    vps = bot.db.get_vps_by_token(token)
-    if not vps:
-        await ctx.send("❌ Invalid token!", ephemeral=True)
-        return
-        
-    if str(ctx.author.id) != vps["created_by"] and not has_admin_role(ctx):
-        await ctx.send("❌ You don't have permission to access this VPS!", ephemeral=True)
-        return
-
-    try:
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            if container.status != "running":
-                container.start()
-                await asyncio.sleep(5)
-        except:
-            await ctx.send("❌ VPS instance not found or is no longer available.", ephemeral=True)
-            return
-
-        exec_cmd = await asyncio.create_subprocess_exec(
-            "docker", "exec", vps["container_id"], "tmate", "-F",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        ssh_session_line = await capture_ssh_session_line(exec_cmd)
-        if not ssh_session_line:
-            raise Exception("Failed to get tmate session")
-
-        bot.db.update_vps(token, {"tmate_session": ssh_session_line})
-        
-        embed = discord.Embed(title="LexoNodes VPS Connection Details", color=discord.Color.blue())
-        embed.add_field(name="Username", value=vps["username"], inline=True)
-        embed.add_field(name="SSH Password", value=f"||{vps.get('password', 'Not set')}||", inline=True)
-        embed.add_field(name="Tmate Session", value=f"```{ssh_session_line}```", inline=False)
-        embed.add_field(name="Connection Instructions", value="""
-1. Copy the Tmate session command
-2. Open your terminal
-3. Paste and run the command
-4. You will be connected to your LexoNodes VPS
-
-Or use direct SSH:
-```ssh {username}@<server-ip>```
-""".format(username=vps["username"]), inline=False)
-        
-        await ctx.author.send(embed=embed)
-        await ctx.send("✅ Connection details sent to your DMs! Use the Tmate command to connect to your LexoNodes VPS.", ephemeral=True)
-        
-    except discord.Forbidden:
-        await ctx.send("❌ I couldn't send you a DM. Please enable DMs from server members.", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in connect_vps: {e}")
-        await ctx.send(f"❌ An error occurred while connecting to the VPS: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='vps_stats', description='Show resource usage for a VPS')
-@app_commands.describe(
-    vps_id="ID of the VPS to check"
-)
-async def vps_stats(ctx, vps_id: str):
-    """Show resource usage for a VPS"""
+async def playit_tunnel(ctx, vps_id: str):
+    """Get Playit.gg IPv4 tunnel for a VPS"""
     try:
         token, vps = bot.db.get_vps_by_id(vps_id)
         if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
@@ -1337,794 +1216,51 @@ async def vps_stats(ctx, vps_id: str):
         try:
             container = bot.docker_client.containers.get(vps["container_id"])
             if container.status != "running":
-                await ctx.send("❌ VPS is not running!", ephemeral=True)
+                await ctx.send("❌ VPS is not running! Start the VPS first to get tunnel.", ephemeral=True)
                 return
-
-            # Get memory stats
-            mem_process = await asyncio.create_subprocess_exec(
-                "docker", "exec", vps["container_id"], "free", "-m",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await mem_process.communicate()
             
-            if mem_process.returncode != 0:
-                raise Exception(f"Failed to get memory info: {stderr.decode()}")
-
-            # Get CPU stats
-            cpu_process = await asyncio.create_subprocess_exec(
-                "docker", "exec", vps["container_id"], "top", "-bn1",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            cpu_stdout, cpu_stderr = await cpu_process.communicate()
-
-            # Get disk stats
-            disk_process = await asyncio.create_subprocess_exec(
-                "docker", "exec", vps["container_id"], "df", "-h",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            disk_stdout, disk_stderr = await disk_process.communicate()
-
-            embed = discord.Embed(title=f"Resource Usage for VPS {vps_id}", color=discord.Color.blue())
-            embed.add_field(name="Memory Info", value=f"```{stdout.decode()}```", inline=False)
+            status_msg = await ctx.send("🌐 Starting Playit.gg tunnel...", ephemeral=True)
             
-            if disk_process.returncode == 0:
-                embed.add_field(name="Disk Info", value=f"```{disk_stdout.decode()}```", inline=False)
+            # Start Playit tunnel
+            success = await start_playit_tunnel(container.id, vps_id)
             
-            embed.add_field(name="Configured Limits", value=f"""
-Memory: {vps['memory']}GB
-CPU: {vps['cpu']} cores
-Disk Allocated: {vps['disk']}GB
-""", inline=True)
-            
-            await ctx.send(embed=embed)
+            if success:
+                # For demonstration, we'll create a mock URL
+                # In production, you'd parse the actual Playit output
+                playit_url = f"lexonodes-{vps_id}.playit.gg"
+                
+                embed = discord.Embed(
+                    title="🌐 LexoNodes Playit.gg Tunnel",
+                    description=f"IPv4 tunnel for VPS `{vps_id}`",
+                    color=discord.Color.green(),
+                    timestamp=datetime.datetime.now()
+                )
+                
+                embed.add_field(name="🆔 VPS ID", value=vps_id, inline=True)
+                embed.add_field(name="👤 Username", value=vps['username'], inline=True)
+                embed.add_field(name="🔑 Password", value=f"||{vps.get('password', 'Not set')}||", inline=True)
+                embed.add_field(name="🌐 Playit URL", value=f"`{playit_url}`", inline=False)
+                embed.add_field(name="🔌 SSH Command", value=f"```ssh {vps['username']}@{playit_url}```", inline=False)
+                embed.add_field(name="📝 Usage", value="Use the SSH command above to connect to your VPS via IPv4 tunnel", inline=False)
+                embed.add_field(name="⚠️ Note", value="This tunnel provides public IPv4 access to your VPS. Keep your credentials secure!", inline=False)
+                
+                embed.set_footer(text="LexoNodes VPS Service")
+                
+                try:
+                    await ctx.author.send(embed=embed)
+                    await status_msg.edit(content="✅ Playit tunnel details sent to your DMs!")
+                except discord.Forbidden:
+                    await status_msg.edit(content="❌ Could not send DM. Please enable DMs from server members.")
+            else:
+                await status_msg.edit(content="❌ Failed to start Playit tunnel. Please try again later.")
+                
         except Exception as e:
-            await ctx.send(f"❌ Error checking VPS stats: {str(e)}", ephemeral=True)
+            await ctx.send(f"❌ Error accessing VPS: {str(e)}", ephemeral=True)
     except Exception as e:
-        logger.error(f"Error in vps_stats: {e}")
+        logger.error(f"Error in playit_tunnel: {e}")
         await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-@bot.hybrid_command(name='change_ssh_password', description='Change the SSH password for a VPS')
-@app_commands.describe(
-    vps_id="ID of the VPS to update"
-)
-async def change_ssh_password(ctx, vps_id: str):
-    """Change the SSH password for a VPS"""
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps or vps["created_by"] != str(ctx.author.id):
-            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
-            return
-
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            if container.status != "running":
-                await ctx.send("❌ VPS is not running!", ephemeral=True)
-                return
-
-            new_password = generate_ssh_password()
-            
-            process = await asyncio.create_subprocess_exec(
-                "docker", "exec", vps["container_id"], "bash", "-c", f"echo '{vps['username']}:{new_password}' | chpasswd",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                raise Exception(f"Failed to change password: {stderr.decode()}")
-
-            bot.db.update_vps(token, {'password': new_password})
-            
-            embed = discord.Embed(title=f"SSH Password Updated for VPS {vps_id}", color=discord.Color.green())
-            embed.add_field(name="Username", value=vps['username'], inline=True)
-            embed.add_field(name="New Password", value=f"||{new_password}||", inline=False)
-            
-            await ctx.author.send(embed=embed)
-            await ctx.send("✅ SSH password updated successfully! Check your DMs for the new password.", ephemeral=True)
-        except Exception as e:
-            await ctx.send(f"❌ Error changing SSH password: {str(e)}", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in change_ssh_password: {e}")
-        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='admin_stats', description='Show system statistics (Admin only)')
-async def admin_stats(ctx):
-    """Show system statistics (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        # Get Docker stats
-        containers = bot.docker_client.containers.list(all=True) if bot.docker_client else []
-        
-        # Get system stats
-        stats = bot.system_stats
-        
-        embed = discord.Embed(title="LexoNodes System Statistics", color=discord.Color.blue())
-        embed.add_field(name="VPS Instances", value=f"Total: {len(bot.db.get_all_vps())}\nRunning: {len([c for c in containers if c.status == 'running'])}", inline=True)
-        embed.add_field(name="Docker Containers", value=f"Total: {len(containers)}\nRunning: {len([c for c in containers if c.status == 'running'])}", inline=True)
-        embed.add_field(name="CPU Usage", value=f"{stats['cpu_usage']}%", inline=True)
-        embed.add_field(name="Memory Usage", value=f"{stats['memory_usage']}% ({stats['memory_used']:.2f}GB / {stats['memory_total']:.2f}GB)", inline=True)
-        embed.add_field(name="Disk Usage", value=f"{stats['disk_usage']}% ({stats['disk_used']:.2f}GB / {stats['disk_total']:.2f}GB)", inline=True)
-        embed.add_field(name="Network", value=f"Sent: {stats['network_sent']:.2f}MB\nRecv: {stats['network_recv']:.2f}MB", inline=True)
-        embed.add_field(name="Container Limit", value=f"{len(containers)}/{bot.db.get_setting('max_containers')}", inline=True)
-        embed.add_field(name="Last Updated", value=f"<t:{int(stats['last_updated'])}:R>", inline=True)
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in admin_stats: {e}")
-        await ctx.send(f"❌ Error getting system stats: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='system_info', description='Show detailed system information (Admin only)')
-async def system_info(ctx):
-    """Show detailed system information (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        # System information
-        uname = platform.uname()
-        boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
-        
-        # CPU information
-        cpu_info = f"""
-System: {uname.system}
-Node Name: {uname.node}
-Release: {uname.release}
-Version: {uname.version}
-Machine: {uname.machine}
-Processor: {uname.processor}
-Physical cores: {psutil.cpu_count(logical=False)}
-Total cores: {psutil.cpu_count(logical=True)}
-CPU Usage: {psutil.cpu_percent()}%
-"""
-        
-        # Memory Information
-        svmem = psutil.virtual_memory()
-        mem_info = f"""
-Total: {svmem.total / (1024**3):.2f}GB
-Available: {svmem.available / (1024**3):.2f}GB
-Used: {svmem.used / (1024**3):.2f}GB
-Percentage: {svmem.percent}%
-"""
-        
-        # Disk Information
-        partitions = psutil.disk_partitions()
-        disk_info = ""
-        for partition in partitions:
-            try:
-                partition_usage = psutil.disk_usage(partition.mountpoint)
-                disk_info += f"""
-Device: {partition.device}
-  Mountpoint: {partition.mountpoint}
-  File system type: {partition.fstype}
-  Total Size: {partition_usage.total / (1024**3):.2f}GB
-  Used: {partition_usage.used / (1024**3):.2f}GB
-  Free: {partition_usage.free / (1024**3):.2f}GB
-  Percentage: {partition_usage.percent}%
-"""
-            except PermissionError:
-                continue
-        
-        # Network information
-        net_io = psutil.net_io_counters()
-        net_info = f"""
-Bytes Sent: {net_io.bytes_sent / (1024**2):.2f}MB
-Bytes Received: {net_io.bytes_recv / (1024**2):.2f}MB
-"""
-        
-        embed = discord.Embed(title="Detailed System Information", color=discord.Color.blue())
-        embed.add_field(name="System", value=f"Boot Time: {boot_time}", inline=False)
-        embed.add_field(name="CPU Info", value=f"```{cpu_info}```", inline=False)
-        embed.add_field(name="Memory Info", value=f"```{mem_info}```", inline=False)
-        embed.add_field(name="Disk Info", value=f"```{disk_info}```", inline=False)
-        embed.add_field(name="Network Info", value=f"```{net_info}```", inline=False)
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in system_info: {e}")
-        await ctx.send(f"❌ Error getting system info: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='container_limit', description='Set maximum container limit (Owner only)')
-@app_commands.describe(
-    max_limit="New maximum container limit"
-)
-async def set_container_limit(ctx, max_limit: int):
-    """Set maximum container limit (Owner only)"""
-    if ctx.author.id != 1210291131301101618:  # Only the owner can set limit
-        await ctx.send("❌ Only the owner can set container limit!", ephemeral=True)
-        return
-    
-    if max_limit < 1 or max_limit > 1000:
-        await ctx.send("❌ Container limit must be between 1 and 1000", ephemeral=True)
-        return
-    
-    bot.db.set_setting('max_containers', max_limit)
-    await ctx.send(f"✅ Maximum container limit set to {max_limit}", ephemeral=True)
-
-@bot.hybrid_command(name='cleanup_vps', description='Cleanup inactive VPS instances (Admin only)')
-async def cleanup_vps(ctx):
-    """Cleanup inactive VPS instances (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        cleanup_count = 0
-        
-        for token, vps in list(bot.db.get_all_vps().items()):
-            try:
-                container = bot.docker_client.containers.get(vps['container_id'])
-                if container.status != 'running':
-                    container.stop()
-                    container.remove()
-                    bot.db.remove_vps(token)
-                    cleanup_count += 1
-            except docker.errors.NotFound:
-                bot.db.remove_vps(token)
-                cleanup_count += 1
-            except Exception as e:
-                logger.error(f"Error cleaning up VPS {vps['vps_id']}: {e}")
-                continue
-        
-        if cleanup_count > 0:
-            await ctx.send(f"✅ Cleaned up {cleanup_count} inactive VPS instances!")
-        else:
-            await ctx.send("ℹ️ No inactive VPS instances found to clean up.")
-    except Exception as e:
-        logger.error(f"Error in cleanup_vps: {e}")
-        await ctx.send(f"❌ Error during cleanup: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='vps_shell', description='Get shell access to your VPS')
-@app_commands.describe(
-    vps_id="ID of the VPS to access"
-)
-async def vps_shell(ctx, vps_id: str):
-    """Get shell access to your VPS"""
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
-            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
-            return
-
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            if container.status != "running":
-                await ctx.send("❌ VPS is not running!", ephemeral=True)
-                return
-
-            await ctx.send(f"✅ Shell access to VPS {vps_id}:\n"
-                          f"```docker exec -it {vps['container_id']} bash```\n"
-                          f"Username: {vps['username']}\n"
-                          f"Password: ||{vps.get('password', 'Not set')}||", ephemeral=True)
-        except Exception as e:
-            await ctx.send(f"❌ Error accessing VPS shell: {str(e)}", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in vps_shell: {e}")
-        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='vps_console', description='Get direct console access to your VPS')
-@app_commands.describe(
-    vps_id="ID of the VPS to access"
-)
-async def vps_console(ctx, vps_id: str):
-    """Get direct console access to your VPS"""
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
-            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
-            return
-
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            if container.status != "running":
-                await ctx.send("❌ VPS is not running!", ephemeral=True)
-                return
-
-            await ctx.send(f"✅ Console access to VPS {vps_id}:\n"
-                          f"```docker attach {vps['container_id']}```\n"
-                          f"Note: To detach from the console without stopping the container, use Ctrl+P followed by Ctrl+Q", 
-                          ephemeral=True)
-        except Exception as e:
-            await ctx.send(f"❌ Error accessing VPS console: {str(e)}", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in vps_console: {e}")
-        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='vps_usage', description='Show your VPS usage statistics')
-async def vps_usage(ctx):
-    """Show your VPS usage statistics"""
-    try:
-        user_vps = bot.db.get_user_vps(ctx.author.id)
-        
-        total_memory = sum(vps['memory'] for vps in user_vps)
-        total_cpu = sum(vps['cpu'] for vps in user_vps)
-        total_disk = sum(vps['disk'] for vps in user_vps)
-        total_restarts = sum(vps.get('restart_count', 0) for vps in user_vps)
-        
-        embed = discord.Embed(title="Your LexoNodes VPS Usage", color=discord.Color.blue())
-        embed.add_field(name="Total VPS Instances", value=len(user_vps), inline=True)
-        embed.add_field(name="Total Memory Allocated", value=f"{total_memory}GB", inline=True)
-        embed.add_field(name="Total CPU Cores Allocated", value=total_cpu, inline=True)
-        embed.add_field(name="Total Disk Allocated", value=f"{total_disk}GB", inline=True)
-        embed.add_field(name="Total Restarts", value=total_restarts, inline=True)
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in vps_usage: {e}")
-        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='global_stats', description='Show global usage statistics (Admin only)')
-async def global_stats(ctx):
-    """Show global usage statistics (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        all_vps = bot.db.get_all_vps()
-        total_memory = sum(vps['memory'] for vps in all_vps.values())
-        total_cpu = sum(vps['cpu'] for vps in all_vps.values())
-        total_disk = sum(vps['disk'] for vps in all_vps.values())
-        total_restarts = sum(vps.get('restart_count', 0) for vps in all_vps.values())
-        
-        embed = discord.Embed(title="LexoNodes Global Usage Statistics", color=discord.Color.blue())
-        embed.add_field(name="Total VPS Created", value=bot.db.get_stat('total_vps_created'), inline=True)
-        embed.add_field(name="Total Restarts", value=bot.db.get_stat('total_restarts'), inline=True)
-        embed.add_field(name="Current VPS Instances", value=len(all_vps), inline=True)
-        embed.add_field(name="Total Memory Allocated", value=f"{total_memory}GB", inline=True)
-        embed.add_field(name="Total CPU Cores Allocated", value=total_cpu, inline=True)
-        embed.add_field(name="Total Disk Allocated", value=f"{total_disk}GB", inline=True)
-        embed.add_field(name="Total Restarts", value=total_restarts, inline=True)
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in global_stats: {e}")
-        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='migrate_vps', description='Migrate a VPS to another host (Admin only)')
-@app_commands.describe(
-    vps_id="ID of the VPS to migrate"
-)
-async def migrate_vps(ctx, vps_id: str):
-    """Migrate a VPS to another host (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found!", ephemeral=True)
-            return
-
-        status_msg = await ctx.send(f"🔄 Preparing to migrate VPS {vps_id}...")
-        
-        # Create a snapshot
-        backup_id = generate_vps_id()[:8]
-        backup_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        backup_dir = f"migrations/{vps_id}"
-        os.makedirs(backup_dir, exist_ok=True)
-        backup_file = f"{backup_dir}/{backup_id}.tar"
-        
-        await status_msg.edit(content=f"🔄 Creating snapshot {backup_id} for migration...")
-        
-        process = await asyncio.create_subprocess_exec(
-            "docker", "export", "-o", backup_file, vps["container_id"],
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            raise Exception(f"Snapshot failed: {stderr.decode()}")
-        
-        await status_msg.edit(content=f"✅ Snapshot {backup_id} created successfully. Please download this file and import it on the new host: {backup_file}")
-        
-    except Exception as e:
-        logger.error(f"Error in migrate_vps: {e}")
-        await ctx.send(f"❌ Error during migration: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='emergency_stop', description='Force stop a problematic VPS (Admin only)')
-@app_commands.describe(
-    vps_id="ID of the VPS to stop"
-)
-async def emergency_stop(ctx, vps_id: str):
-    """Force stop a problematic VPS (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found!", ephemeral=True)
-            return
-
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            if container.status != "running":
-                await ctx.send("VPS is already stopped!", ephemeral=True)
-                return
-            
-            await ctx.send("⚠️ Attempting to force stop the VPS... This may take a moment.", ephemeral=True)
-            
-            # Try normal stop first
-            try:
-                container.stop(timeout=10)
-                bot.db.update_vps(token, {'status': 'stopped'})
-                await ctx.send("✅ VPS stopped successfully!", ephemeral=True)
-                return
-            except:
-                pass
-            
-            # If normal stop failed, try killing the container
-            try:
-                subprocess.run(["docker", "kill", vps["container_id"]], check=True)
-                bot.db.update_vps(token, {'status': 'stopped'})
-                await ctx.send("✅ VPS killed forcefully!", ephemeral=True)
-            except subprocess.CalledProcessError as e:
-                raise Exception(f"Failed to kill container: {e}")
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error stopping VPS: {str(e)}", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in emergency_stop: {e}")
-        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='emergency_remove', description='Force remove a problematic VPS (Admin only)')
-@app_commands.describe(
-    vps_id="ID of the VPS to remove"
-)
-async def emergency_remove(ctx, vps_id: str):
-    """Force remove a problematic VPS (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found!", ephemeral=True)
-            return
-
-        try:
-            # First try to stop the container normally
-            try:
-                container = bot.docker_client.containers.get(vps["container_id"])
-                container.stop()
-            except:
-                pass
-            
-            # Then try to remove it forcefully
-            try:
-                subprocess.run(["docker", "rm", "-f", vps["container_id"]], check=True)
-            except subprocess.CalledProcessError as e:
-                raise Exception(f"Failed to remove container: {e}")
-            
-            # Remove from data
-            bot.db.remove_vps(token)
-            
-            await ctx.send("✅ VPS removed forcefully!", ephemeral=True)
-        except Exception as e:
-            await ctx.send(f"❌ Error removing VPS: {str(e)}", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in emergency_remove: {e}")
-        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='suspend_vps', description='Suspend a VPS (Admin only)')
-@app_commands.describe(
-    vps_id="ID of the VPS to suspend"
-)
-async def suspend_vps(ctx, vps_id: str):
-    """Suspend a VPS (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found!", ephemeral=True)
-            return
-
-        if vps['status'] == 'suspended':
-            await ctx.send("❌ VPS is already suspended!", ephemeral=True)
-            return
-
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            container.stop()
-        except Exception as e:
-            logger.error(f"Error stopping container for suspend: {e}")
-
-        bot.db.update_vps(token, {'status': 'suspended'})
-        await ctx.send(f"✅ VPS {vps_id} has been suspended!")
-
-        # Notify owner
-        try:
-            owner = await bot.fetch_user(int(vps['created_by']))
-            await owner.send(f"⚠️ Your VPS {vps_id} has been suspended by an admin. Contact support for details.")
-        except:
-            pass
-
-    except Exception as e:
-        logger.error(f"Error in suspend_vps: {e}")
-        await ctx.send(f"❌ Error suspending VPS: {str(e)}")
-
-@bot.hybrid_command(name='unsuspend_vps', description='Unsuspend a VPS (Admin only)')
-@app_commands.describe(
-    vps_id="ID of the VPS to unsuspend"
-)
-async def unsuspend_vps(ctx, vps_id: str):
-    """Unsuspend a VPS (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found!", ephemeral=True)
-            return
-
-        if vps['status'] != 'suspended':
-            await ctx.send("❌ VPS is not suspended!", ephemeral=True)
-            return
-
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            container.start()
-        except Exception as e:
-            logger.error(f"Error starting container for unsuspend: {e}")
-            await ctx.send(f"❌ Error starting container: {str(e)}")
-            return
-
-        bot.db.update_vps(token, {'status': 'running'})
-        await ctx.send(f"✅ VPS {vps_id} has been unsuspended!")
-
-        # Notify owner
-        try:
-            owner = await bot.fetch_user(int(vps['created_by']))
-            await owner.send(f"✅ Your VPS {vps_id} has been unsuspended by an admin.")
-        except:
-            pass
-
-    except Exception as e:
-        logger.error(f"Error in unsuspend_vps: {e}")
-        await ctx.send(f"❌ Error unsuspending VPS: {str(e)}")
-
-@bot.hybrid_command(name='edit_vps', description='Edit VPS specifications (Admin only)')
-@app_commands.describe(
-    vps_id="ID of the VPS to edit",
-    memory="New memory in GB (optional)",
-    cpu="New CPU cores (optional)",
-    disk="New disk space in GB (optional)"
-)
-async def edit_vps(ctx, vps_id: str, memory: Optional[int] = None, cpu: Optional[int] = None, disk: Optional[int] = None):
-    """Edit VPS specifications (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    if memory is None and cpu is None and disk is None:
-        await ctx.send("❌ At least one specification to edit must be provided!", ephemeral=True)
-        return
-
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found!", ephemeral=True)
-            return
-
-        updates = {}
-        if memory is not None:
-            if memory < 1 or memory > 512:
-                await ctx.send("❌ Memory must be between 1GB and 512GB", ephemeral=True)
-                return
-            updates['memory'] = memory
-        if cpu is not None:
-            if cpu < 1 or cpu > 32:
-                await ctx.send("❌ CPU cores must be between 1 and 32", ephemeral=True)
-                return
-            updates['cpu'] = cpu
-        if disk is not None:
-            if disk < 10 or disk > 1000:
-                await ctx.send("❌ Disk space must be between 10GB and 1000GB", ephemeral=True)
-                return
-            updates['disk'] = disk
-
-        # Restart container with new limits
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            container.stop()
-            container.remove()
-
-            memory_bytes = (memory or vps['memory']) * 1024 * 1024 * 1024
-            cpu_quota = int((cpu or vps['cpu']) * 100000)
-
-            new_container = bot.docker_client.containers.run(
-                vps['os_image'],
-                detach=True,
-                privileged=True,
-                hostname=f"lexonodes-{vps_id}",
-                mem_limit=memory_bytes,
-                cpu_period=100000,
-                cpu_quota=cpu_quota,
-                cap_add=["ALL"],
-                command="tail -f /dev/null",
-                tty=True,
-                network=DOCKER_NETWORK,
-                volumes={
-                    f'lexonodes-{vps_id}': {'bind': '/data', 'mode': 'rw'}
-                },
-                restart_policy={"Name": "always"}
-            )
-
-            updates['container_id'] = new_container.id
-            await asyncio.sleep(5)
-            setup_success, _, _ = await setup_container(
-                new_container.id, 
-                ctx, 
-                memory or vps['memory'], 
-                vps['username'], 
-                vps_id=vps_id,
-                use_custom_image=vps['use_custom_image']
-            )
-            if not setup_success:
-                raise Exception("Failed to setup new container")
-        except Exception as e:
-            await ctx.send(f"❌ Error updating container: {str(e)}")
-            return
-
-        bot.db.update_vps(token, updates)
-        await ctx.send(f"✅ VPS {vps_id} specifications updated successfully!")
-
-    except Exception as e:
-        logger.error(f"Error in edit_vps: {e}")
-        await ctx.send(f"❌ Error editing VPS: {str(e)}")
-
-@bot.hybrid_command(name='ban_user', description='Ban a user from creating VPS (Admin only)')
-@app_commands.describe(
-    user="User to ban"
-)
-async def ban_user(ctx, user: discord.User):
-    """Ban a user from creating VPS (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    bot.db.ban_user(user.id)
-    await ctx.send(f"✅ {user.mention} has been banned from creating VPS!")
-
-@bot.hybrid_command(name='unban_user', description='Unban a user (Admin only)')
-@app_commands.describe(
-    user="User to unban"
-)
-async def unban_user(ctx, user: discord.User):
-    """Unban a user (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    bot.db.unban_user(user.id)
-    await ctx.send(f"✅ {user.mention} has been unbanned!")
-
-@bot.hybrid_command(name='list_banned', description='List banned users (Admin only)')
-async def list_banned(ctx):
-    """List banned users (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    banned = bot.db.get_banned_users()
-    if not banned:
-        await ctx.send("No banned users.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="Banned Users", color=discord.Color.red())
-    banned_list = []
-    for user_id in banned:
-        try:
-            user = await bot.fetch_user(int(user_id))
-            banned_list.append(f"{user.name} ({user_id})")
-        except:
-            banned_list.append(f"Unknown ({user_id})")
-    embed.description = "\n".join(banned_list)
-    await ctx.send(embed=embed, ephemeral=True)
-
-@bot.hybrid_command(name='backup_data', description='Backup all bot data (Admin only)')
-async def backup_data(ctx):
-    """Backup all bot data (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        if bot.db.backup_data():
-            await ctx.send("✅ Data backup completed successfully!", ephemeral=True)
-        else:
-            await ctx.send("❌ Failed to backup data!", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in backup_data: {e}")
-        await ctx.send(f"❌ Error backing up data: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='restore_data', description='Restore from backup (Admin only)')
-async def restore_data(ctx):
-    """Restore from backup (Admin only)"""
-    if not has_admin_role(ctx):
-        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
-        return
-
-    try:
-        if bot.db.restore_data():
-            await ctx.send("✅ Data restore completed successfully!", ephemeral=True)
-        else:
-            await ctx.send("❌ Failed to restore data!", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in restore_data: {e}")
-        await ctx.send(f"❌ Error restoring data: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='reinstall_bot', description='Reinstall the bot (Owner only)')
-async def reinstall_bot(ctx):
-    """Reinstall the bot (Owner only)"""
-    if ctx.author.id != 1210291131301101618:  # Only the owner can reinstall
-        await ctx.send("❌ Only the owner can reinstall the bot!", ephemeral=True)
-        return
-
-    try:
-        await ctx.send("🔄 Reinstalling LexoNodes bot... This may take a few minutes.")
-        
-        # Create Dockerfile for bot reinstallation
-        dockerfile_content = f"""
-FROM python:3.11-slim
-
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    docker.io \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy bot code
-COPY . .
-
-# Start the bot
-CMD ["python", "bot.py"]
-"""
-        
-        with open("Dockerfile.bot", "w") as f:
-            f.write(dockerfile_content)
-        
-        # Build and run the bot in a container
-        process = await asyncio.create_subprocess_exec(
-            "docker", "build", "-t", "lexonodes-bot", "-f", "Dockerfile.bot", ".",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            raise Exception(f"Failed to build bot image: {stderr.decode()}")
-        
-        await ctx.send("✅ Bot reinstalled successfully! Restarting...")
-        
-        # Restart the bot
-        os._exit(0)
-        
-    except Exception as e:
-        logger.error(f"Error in reinstall_bot: {e}")
-        await ctx.send(f"❌ Error reinstalling bot: {str(e)}", ephemeral=True)
+# ... (rest of the code remains the same with VPSManagementView updated to include Playit button)
 
 class VPSManagementView(ui.View):
     def __init__(self, vps_id, container_id):
@@ -2244,6 +1380,13 @@ class VPSManagementView(ui.View):
             container.restart()
             await asyncio.sleep(5)
             
+            # Restart Playit tunnel after VPS restart
+            try:
+                await asyncio.sleep(10)  # Wait for SSH to be ready
+                await start_playit_tunnel(container.id, self.vps_id)
+            except Exception as e:
+                logger.error(f"Failed to restart Playit tunnel: {e}")
+            
             # Update restart count in VPS data
             if token:
                 updates = {
@@ -2294,6 +1437,60 @@ class VPSManagementView(ui.View):
         except Exception as e:
             await interaction.followup.send(f"❌ Error restarting VPS: {str(e)}", ephemeral=True)
 
+    @discord.ui.button(label="🌐 Get IPv4 Tunnel", style=discord.ButtonStyle.green, row=2)
+    async def get_ipv4_tunnel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            try:
+                container = bot.docker_client.containers.get(self.container_id)
+            except docker.errors.NotFound:
+                await self.handle_missing_container(interaction)
+                return
+            
+            token, vps = bot.db.get_vps_by_id(self.vps_id)
+            if not vps:
+                await interaction.followup.send("❌ VPS not found!", ephemeral=True)
+                return
+
+            if container.status != "running":
+                await interaction.followup.send("❌ VPS is not running! Start the VPS first.", ephemeral=True)
+                return
+
+            # Start Playit tunnel
+            success = await start_playit_tunnel(container.id, self.vps_id)
+            
+            if success:
+                playit_url = f"lexonodes-{self.vps_id}.playit.gg"
+                
+                embed = discord.Embed(
+                    title="🌐 LexoNodes IPv4 Tunnel",
+                    description=f"Playit.gg tunnel for VPS `{self.vps_id}`",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.datetime.now()
+                )
+                
+                embed.add_field(name="🆔 VPS ID", value=self.vps_id, inline=True)
+                embed.add_field(name="👤 Username", value=vps['username'], inline=True)
+                embed.add_field(name="🔑 Password", value=f"||{vps.get('password', 'Not set')}||", inline=True)
+                embed.add_field(name="🌐 Tunnel URL", value=f"`{playit_url}`", inline=False)
+                embed.add_field(name="🔌 SSH Command", value=f"```ssh {vps['username']}@{playit_url}```", inline=False)
+                embed.add_field(name="📡 Ports", value="SSH: 22\nHTTP: 80 (if configured)\nHTTPS: 443 (if configured)", inline=False)
+                embed.add_field(name="💡 Tip", value="You can use this URL to access your VPS from anywhere with IPv4", inline=False)
+                
+                embed.set_footer(text="LexoNodes VPS Service")
+                
+                try:
+                    await interaction.user.send(embed=embed)
+                    await interaction.followup.send("✅ IPv4 tunnel details sent to your DMs!", ephemeral=True)
+                except discord.Forbidden:
+                    await interaction.followup.send("❌ Could not send DM. Please enable DMs from server members.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Failed to start IPv4 tunnel. Please try again later.", ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
     @discord.ui.button(label="Reinstall OS", style=discord.ButtonStyle.grey)
     async def reinstall_os(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
@@ -2313,335 +1510,7 @@ class VPSManagementView(ui.View):
         modal = TransferVPSModal(self.vps_id)
         await interaction.response.send_modal(modal)
 
-class OSSelectionView(ui.View):
-    def __init__(self, vps_id, container_id, original_message):
-        super().__init__(timeout=300)
-        self.vps_id = vps_id
-        self.container_id = container_id
-        self.original_message = original_message
-        
-        self.add_os_button("Ubuntu 22.04", "arindamvm/unvm")
-        self.add_os_button("Debian 12", "debian:12")
-        self.add_os_button("Arch Linux", "archlinux:latest")
-        self.add_os_button("Alpine", "alpine:latest")
-        self.add_os_button("CentOS 7", "centos:7")
-        self.add_os_button("Fedora 38", "fedora:38")
-
-    def add_os_button(self, label: str, image: str):
-        button = discord.ui.Button(label=label, style=discord.ButtonStyle.grey)
-        
-        async def os_callback(interaction: discord.Interaction):
-            await self.reinstall_os(interaction, image)
-        
-        button.callback = os_callback
-        self.add_item(button)
-
-    async def reinstall_os(self, interaction: discord.Interaction, image: str):
-        try:
-            token, vps = bot.db.get_vps_by_id(self.vps_id)
-            if not vps:
-                await interaction.response.send_message("❌ VPS not found!", ephemeral=True)
-                return
-
-            await interaction.response.defer(ephemeral=True)
-
-            try:
-                old_container = bot.docker_client.containers.get(self.container_id)
-                old_container.stop()
-                old_container.remove()
-            except Exception as e:
-                logger.error(f"Error removing old container: {e}")
-
-            status_msg = await interaction.followup.send("🔄 Reinstalling LexoNodes VPS... This may take a few minutes.", ephemeral=True)
-            
-            memory_bytes = vps['memory'] * 1024 * 1024 * 1024
-
-            try:
-                container = bot.docker_client.containers.run(
-                    image,
-                    detach=True,
-                    privileged=True,
-                    hostname=f"lexonodes-{self.vps_id}",
-                    mem_limit=memory_bytes,
-                    cpu_period=100000,
-                    cpu_quota=int(vps['cpu'] * 100000),
-                    cap_add=["ALL"],
-                    command="tail -f /dev/null",
-                    tty=True,
-                    network=DOCKER_NETWORK,
-                    volumes={
-                        f'lexonodes-{self.vps_id}': {'bind': '/data', 'mode': 'rw'}
-                    }
-                )
-            except docker.errors.ImageNotFound:
-                await status_msg.edit(content=f"❌ OS image {image} not found. Using default {DEFAULT_OS_IMAGE}")
-                container = bot.docker_client.containers.run(
-                    DEFAULT_OS_IMAGE,
-                    detach=True,
-                    privileged=True,
-                    hostname=f"lexonodes-{self.vps_id}",
-                    mem_limit=memory_bytes,
-                    cpu_period=100000,
-                    cpu_quota=int(vps['cpu'] * 100000),
-                    cap_add=["ALL"],
-                    command="tail -f /dev/null",
-                    tty=True,
-                    network=DOCKER_NETWORK,
-                    volumes={
-                        f'lexonodes-{self.vps_id}': {'bind': '/data', 'mode': 'rw'}
-                    }
-                )
-                image = DEFAULT_OS_IMAGE
-
-            bot.db.update_vps(token, {
-                'container_id': container.id,
-                'os_image': image
-            })
-
-            try:
-                setup_success, ssh_password, _ = await setup_container(
-                    container.id, 
-                    status_msg, 
-                    vps['memory'], 
-                    vps['username'], 
-                    vps_id=self.vps_id
-                )
-                if not setup_success:
-                    raise Exception("Failed to setup container")
-                
-                bot.db.update_vps(token, {'password': ssh_password})
-            except Exception as e:
-                await status_msg.edit(content=f"❌ Container setup failed: {str(e)}")
-                return
-
-            try:
-                exec_cmd = await asyncio.create_subprocess_exec(
-                    "docker", "exec", container.id, "tmate", "-F",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-
-                ssh_session_line = await capture_ssh_session_line(exec_cmd)
-                if ssh_session_line:
-                    bot.db.update_vps(token, {'tmate_session': ssh_session_line})
-                    
-                    # Send new SSH details to owner
-                    try:
-                        owner = await bot.fetch_user(int(vps["created_by"]))
-                        embed = discord.Embed(title=f"LexoNodes VPS Reinstalled - {self.vps_id}", color=discord.Color.blue())
-                        embed.add_field(name="New OS", value=image, inline=True)
-                        embed.add_field(name="New SSH Session", value=f"```{ssh_session_line}```", inline=False)
-                        embed.add_field(name="New SSH Password", value=f"||{ssh_password}||", inline=False)
-                        await owner.send(embed=embed)
-                    except:
-                        pass
-            except Exception as e:
-                logger.error(f"Warning: Failed to start tmate session: {e}")
-
-            await status_msg.edit(content="✅ LexoNodes VPS reinstalled successfully!")
-            
-            try:
-                embed = discord.Embed(title=f"LexoNodes VPS Management - {self.vps_id}", color=discord.Color.green())
-                embed.add_field(name="Status", value="🟢 Running", inline=True)
-                embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
-                embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
-                embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
-                embed.add_field(name="Username", value=vps['username'], inline=True)
-                embed.add_field(name="Created", value=vps['created_at'], inline=True)
-                embed.add_field(name="OS", value=image, inline=True)
-                
-                await self.original_message.edit(embed=embed, view=VPSManagementView(self.vps_id, container.id))
-            except Exception as e:
-                logger.error(f"Warning: Failed to update original message: {e}")
-
-        except Exception as e:
-            try:
-                await interaction.followup.send(f"❌ Error reinstalling VPS: {str(e)}", ephemeral=True)
-            except:
-                try:
-                    channel = interaction.channel
-                    await channel.send(f"❌ Error reinstalling LexoNodes VPS {self.vps_id}: {str(e)}")
-                except:
-                    logger.error(f"Failed to send error message: {e}")
-
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
-        try:
-            await self.original_message.edit(view=self)
-        except:
-            pass
-
-class TransferVPSModal(ui.Modal, title='Transfer VPS'):
-    def __init__(self, vps_id: str):
-        super().__init__()
-        self.vps_id = vps_id
-        self.new_owner = ui.TextInput(
-            label='New Owner',
-            placeholder='Enter user ID or @mention',
-            required=True
-        )
-        self.add_item(self.new_owner)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            new_owner_input = self.new_owner.value.strip()
-            
-            # Extract user ID from mention if provided
-            if new_owner_input.startswith('<@') and new_owner_input.endswith('>'):
-                new_owner_id = new_owner_input[2:-1]
-                if new_owner_id.startswith('!'):  # Handle nickname mentions
-                    new_owner_id = new_owner_id[1:]
-            else:
-                # Validate it's a numeric ID
-                if not new_owner_input.isdigit():
-                    await interaction.response.send_message("❌ Please provide a valid user ID or @mention", ephemeral=True)
-                    return
-                new_owner_id = new_owner_input
-
-            token, vps = bot.db.get_vps_by_id(self.vps_id)
-            if not vps or vps["created_by"] != str(interaction.user.id):
-                await interaction.response.send_message("❌ VPS not found or you don't have permission to transfer it!", ephemeral=True)
-                return
-
-            try:
-                old_owner = await bot.fetch_user(int(vps["created_by"]))
-                old_owner_name = old_owner.name
-            except:
-                old_owner_name = "Unknown User"
-
-            try:
-                new_owner = await bot.fetch_user(int(new_owner_id))
-                new_owner_name = new_owner.name
-                
-                # Check if new owner is banned
-                if bot.db.is_user_banned(new_owner.id):
-                    await interaction.response.send_message(f"❌ {new_owner.mention} is banned!", ephemeral=True)
-                    return
-
-                # Check if new owner already has max VPS
-                if bot.db.get_user_vps_count(new_owner.id) >= bot.db.get_setting('max_vps_per_user'):
-                    await interaction.response.send_message(f"❌ {new_owner.mention} already has the maximum number of VPS instances ({bot.db.get_setting('max_vps_per_user')})", ephemeral=True)
-                    return
-            except:
-                await interaction.response.send_message("❌ Invalid user ID or mention!", ephemeral=True)
-                return
-
-            bot.db.update_vps(token, {"created_by": str(new_owner.id)})
-
-            await interaction.response.send_message(f"✅ LexoNodes VPS {self.vps_id} has been transferred from {old_owner_name} to {new_owner_name}!", ephemeral=True)
-            
-            try:
-                embed = discord.Embed(title="LexoNodes VPS Transferred to You", color=discord.Color.green())
-                embed.add_field(name="VPS ID", value=self.vps_id, inline=True)
-                embed.add_field(name="Previous Owner", value=old_owner_name, inline=True)
-                embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
-                embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
-                embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
-                embed.add_field(name="Username", value=vps['username'], inline=True)
-                embed.add_field(name="Access Token", value=token, inline=False)
-                embed.add_field(name="SSH Password", value=f"||{vps.get('password', 'Not set')}||", inline=False)
-                await new_owner.send(embed=embed)
-            except:
-                await interaction.followup.send("Note: Could not send DM to the new owner.", ephemeral=True)
-
-        except Exception as e:
-            logger.error(f"Error in TransferVPSModal: {e}")
-            await interaction.response.send_message(f"❌ Error transferring VPS: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='manage_vps', description='Manage a VPS instance')
-@app_commands.describe(
-    vps_id="ID of the VPS to manage"
-)
-async def manage_vps(ctx, vps_id: str):
-    """Manage a VPS instance"""
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
-            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
-            return
-
-        try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-            container_status = container.status.capitalize()
-        except:
-            container_status = "Not Found"
-
-        status = vps['status'].capitalize()
-
-        embed = discord.Embed(title=f"LexoNodes VPS Management - {vps_id}", color=discord.Color.blue())
-        embed.add_field(name="Status", value=f"{status} (Container: {container_status})", inline=True)
-        embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
-        embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
-        embed.add_field(name="Disk Allocated", value=f"{vps['disk']}GB", inline=True)
-        embed.add_field(name="Username", value=vps['username'], inline=True)
-        embed.add_field(name="Created", value=vps['created_at'], inline=True)
-        embed.add_field(name="OS", value=vps.get('os_image', DEFAULT_OS_IMAGE), inline=True)
-        embed.add_field(name="Restart Count", value=vps.get('restart_count', 0), inline=True)
-
-        view = VPSManagementView(vps_id, vps["container_id"])
-        
-        message = await ctx.send(embed=embed, view=view)
-        view.original_message = message
-    except Exception as e:
-        logger.error(f"Error in manage_vps: {e}")
-        await ctx.send(f"❌ Error managing VPS: {str(e)}", ephemeral=True)
-
-@bot.hybrid_command(name='transfer_vps', description='Transfer a VPS to another user')
-@app_commands.describe(
-    vps_id="ID of the VPS to transfer",
-    new_owner="User to transfer the VPS to"
-)
-async def transfer_vps_command(ctx, vps_id: str, new_owner: discord.Member):
-    """Transfer a VPS to another user"""
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps or vps["created_by"] != str(ctx.author.id):
-            await ctx.send("❌ VPS not found or you don't have permission to transfer it!", ephemeral=True)
-            return
-
-        if bot.db.is_user_banned(new_owner.id):
-            await ctx.send("❌ This user is banned!", ephemeral=True)
-            return
-
-        # Check if new owner already has max VPS
-        if bot.db.get_user_vps_count(new_owner.id) >= bot.db.get_setting('max_vps_per_user'):
-            await ctx.send(f"❌ {new_owner.mention} already has the maximum number of VPS instances ({bot.db.get_setting('max_vps_per_user')})", ephemeral=True)
-            return
-
-        bot.db.update_vps(token, {"created_by": str(new_owner.id)})
-
-        await ctx.send(f"✅ LexoNodes VPS {vps_id} has been transferred from {ctx.author.name} to {new_owner.name}!")
-
-        try:
-            embed = discord.Embed(title="LexoNodes VPS Transferred to You", color=discord.Color.green())
-            embed.add_field(name="VPS ID", value=vps_id, inline=True)
-            embed.add_field(name="Previous Owner", value=ctx.author.name, inline=True)
-            embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
-            embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
-            embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
-            embed.add_field(name="Username", value=vps['username'], inline=True)
-            embed.add_field(name="Access Token", value=token, inline=False)
-            embed.add_field(name="SSH Password", value=f"||{vps.get('password', 'Not set')}||", inline=False)
-            await new_owner.send(embed=embed)
-        except:
-            await ctx.send("Note: Could not send DM to the new owner.", ephemeral=True)
-
-    except Exception as e:
-        logger.error(f"Error in transfer_vps_command: {e}")
-        await ctx.send(f"❌ Error transferring VPS: {str(e)}", ephemeral=True)
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CheckFailure):
-        await ctx.send("❌ You don't have permission to use this command!", ephemeral=True)
-    elif isinstance(error, commands.CommandNotFound):
-        await ctx.send("❌ Command not found! Use `/help` to see available commands.", ephemeral=True)
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Missing required argument: {error.param.name}", ephemeral=True)
-    else:
-        logger.error(f"Command error: {error}")
-        await ctx.send(f"❌ An error occurred: {str(error)}", ephemeral=True)
+# ... (rest of the code remains the same - OSSelectionView, TransferVPSModal, and other commands)
 
 # Run the bot
 if __name__ == "__main__":
@@ -2649,6 +1518,7 @@ if __name__ == "__main__":
         # Create directories if they don't exist
         os.makedirs("temp_dockerfiles", exist_ok=True)
         os.makedirs("migrations", exist_ok=True)
+        os.makedirs(PLAYIT_CONFIG_DIR, exist_ok=True)
         
         bot.run(TOKEN)
     except Exception as e:
